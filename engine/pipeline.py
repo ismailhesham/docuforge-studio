@@ -2,12 +2,14 @@ import json
 import os
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import soundfile as sf
 from PIL import Image
 from config import FPS, HEIGHT, PROJECTS_DIR, WIDTH
 from engine.compositor import (
     apply_shot_graphics,
+    build_combined_static_overlay,
     decode_shot_base_frames,
     prepare_watermark_layer,
 )
@@ -17,26 +19,38 @@ from engine.tts_engine import export_srt, synthesize_all_shots
 
 
 def _has_nvenc() -> bool:
+    """اختبار حقيقي لتشغيل مشفر كارت الشاشة NVENC على السيرفر."""
     try:
-        res = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=8)
-        return "h264_nvenc" in res.stdout
+        res = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.1",
+                "-c:v", "h264_nvenc", "-f", "null", "-"
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8
+        )
+        return res.returncode == 0
     except Exception:
         return False
 
 
 USE_NVENC = _has_nvenc()
+RENDER_WORKERS = min(4, max(2, (os.cpu_count() or 4) // 2))
 
 
-def render_single_shot_segment(sh: dict, seg_path: str, tmp_dir: str, watermark_layer=None):
-    """رندر لقطة واحدة مباشرة إلى القرص بدون استهلاك رامات للفيديوهات الطويلة (30 دقيقة)."""
+def render_single_shot_segment(sh: dict, seg_path: str, tmp_dir: str, watermark_layer=None, static_overlay=None):
+    """رندر لقطة واحدة بأقصى سرعة مباشرة عبر الذاكرة إلى NVENC/x264 بدون استهلاك رامات إضافية."""
     frames = decode_shot_base_frames(sh, tmp_dir)
     sec_img = None
     if sh.get("secondary_asset") and os.path.exists(sh["secondary_asset"]):
         sec_img = safe_margin_crop_resize(Image.open(sh["secondary_asset"]))
 
-    vcodec = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19"] if USE_NVENC else ["-c:v", "libx264", "-preset", "fast", "-crf", "19"]
+    if static_overlay is None:
+        static_overlay = build_combined_static_overlay(watermark_layer)
+
+    vcodec = ["-c:v", "h264_nvenc", "-preset", "p2", "-cq", "19"] if USE_NVENC else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-threads", "2"]
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-f", "rawvideo", "-vcodec", "rawvideo",
         "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "rgb24", "-r", str(FPS),
         "-i", "-",
@@ -44,7 +58,12 @@ def render_single_shot_segment(sh: dict, seg_path: str, tmp_dir: str, watermark_
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for idx, base_fr in enumerate(frames):
-        comp = apply_shot_graphics(base_fr, sh, idx, watermark_layer=watermark_layer, sec_img=sec_img)
+        comp = apply_shot_graphics(
+            base_fr, sh, idx,
+            watermark_layer=watermark_layer,
+            sec_img=sec_img,
+            static_overlay=static_overlay,
+        )
         proc.stdin.write(comp.tobytes())
     proc.stdin.close()
     proc.wait()
@@ -80,7 +99,6 @@ def mux_final_video(segments: list, voice_wav: str, custom_bgm_path: str, out_mp
         bgm_src = os.path.join(work_dir, "auto_bgm.wav")
         _generate_cinematic_drone_bed(vo_info.duration + 2.0, bgm_src)
 
-    # مكساج احترافي بخفض صوت الموسيقى تلقائياً وقت كلام الراوي (Audio Ducking) + معايرة يوتيوب
     filter_complex = (
         "[1:a]aresample=24000,volume=1.05[vo];"
         "[2:a]aresample=24000,aloop=loop=-1:size=2e+09,atrim=0:" + f"{vo_info.duration:.2f}" + ",volume=0.22[bgm];"
@@ -127,7 +145,7 @@ def run_full_production(
 
     sb_path = os.path.join(pdir, "storyboard.json")
 
-    # المرحلة 1: الإخراج وتقسيم المشاهد عبر DeepSeek (أو الاستكمال التلقائي)
+    # المرحلة 1: الإخراج وتقسيم المشاهد عبر DeepSeek
     if resume_checkpoint and os.path.exists(sb_path):
         with open(sb_path, "r", encoding="utf-8") as f:
             shots = json.load(f)
@@ -138,7 +156,7 @@ def run_full_production(
         with open(sb_path, "w", encoding="utf-8") as f:
             json.dump(shots, f, indent=2, ensure_ascii=False)
 
-    # المرحلة 2: توليد الصوت مفتوح المصدر وملف الترجمة SRT
+    # المرحلة 2: توليد الصوت مفتوح المصدر (يحدد المدة الحقيقية لكل لقطة تلقائياً من الاسكربت)
     master_vo = synthesize_all_shots(
         shots, audio_dir, engine_type=tts_engine_choice, kokoro_voice=kokoro_voice,
         speed=voice_speed, ref_audio_path=ref_voice_file, progress_cb=progress_cb
@@ -153,19 +171,37 @@ def run_full_production(
     with open(sb_path, "w", encoding="utf-8") as f:
         json.dump(shots, f, indent=2, ensure_ascii=False)
 
-    # المرحلة 4: رندر المقاطع المتدفق 1080p مع الجرافيك واللوجو الشفاف
+    # المرحلة 4: الرندرة المتوازية فائقة السرعة (Multi-Worker Turbo Render + NVENC)
     wm_layer = prepare_watermark_layer(logo_img_file, logo_text, logo_opacity, logo_pos)
-    seg_files = []
+    combined_static = build_combined_static_overlay(wm_layer)
     total = len(shots)
-    for idx, sh in enumerate(shots):
-        seg_mp4 = os.path.join(seg_dir, f"seg_{sh['id']:04d}.mp4")
-        if not (resume_checkpoint and os.path.exists(seg_mp4) and os.path.getsize(seg_mp4) > 10_000):
-            render_single_shot_segment(sh, seg_mp4, seg_dir, watermark_layer=wm_layer)
-        seg_files.append(seg_mp4)
-        if progress_cb:
-            frac = 0.58 + 0.35 * ((idx + 1) / max(1, total))
-            enc_tag = "GPU NVENC" if USE_NVENC else "CPU x264"
-            progress_cb(frac, f"رندر المونتاج والجرافيك ({enc_tag}): اللقطة {idx+1} من {total}")
+    seg_files = [os.path.join(seg_dir, f"seg_{sh['id']:04d}.mp4") for sh in shots]
+
+    pending_tasks = []
+    done_count = 0
+    for sh, seg_mp4 in zip(shots, seg_files):
+        if resume_checkpoint and os.path.exists(seg_mp4) and os.path.getsize(seg_mp4) > 10_000:
+            done_count += 1
+        else:
+            pending_tasks.append((sh, seg_mp4))
+
+    enc_tag = f"GPU NVENC x{RENDER_WORKERS}" if USE_NVENC else f"Turbo CPU x{RENDER_WORKERS}"
+    if progress_cb and done_count > 0:
+        frac = 0.58 + 0.35 * (done_count / max(1, total))
+        progress_cb(frac, f"تخطي {done_count} لقطة مرندرة مسبقاً، جاري رندر المتبقي ({enc_tag})...")
+
+    if pending_tasks:
+        with ThreadPoolExecutor(max_workers=RENDER_WORKERS) as pool:
+            futures = {
+                pool.submit(render_single_shot_segment, sh, seg_mp4, seg_dir, wm_layer, combined_static): sh["id"]
+                for sh, seg_mp4 in pending_tasks
+            }
+            for fut in as_completed(futures):
+                fut.result()
+                done_count += 1
+                if progress_cb:
+                    frac = 0.58 + 0.35 * (done_count / max(1, total))
+                    progress_cb(frac, f"رندر المونتاج التيربو ({enc_tag}): اكتملت {done_count} من {total} لقطة")
 
     # المرحلة 5: الدمج النهائي والمكساج الصوتي
     if progress_cb:
@@ -202,9 +238,10 @@ def quick_swap_single_shot(project_name: str, shot_number: int, new_query: str, 
     gk.unload()
 
     wm_layer = prepare_watermark_layer(logo_img_file, logo_text, logo_opacity, logo_pos)
+    combined_static = build_combined_static_overlay(wm_layer)
     seg_dir = os.path.join(pdir, "segments")
     seg_mp4 = os.path.join(seg_dir, f"seg_{target['id']:04d}.mp4")
-    render_single_shot_segment(target, seg_mp4, seg_dir, watermark_layer=wm_layer)
+    render_single_shot_segment(target, seg_mp4, seg_dir, watermark_layer=wm_layer, static_overlay=combined_static)
 
     with open(sb_path, "w", encoding="utf-8") as f:
         json.dump(shots, f, indent=2, ensure_ascii=False)
