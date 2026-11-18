@@ -82,17 +82,24 @@ def _generate_cinematic_drone_bed(duration_sec: float, out_wav: str):
 
 def mux_final_video(segments: list, voice_wav: str, custom_bgm_path: str, out_mp4: str, work_dir: str):
     concat_txt = os.path.join(work_dir, "segments_list.txt")
+    valid_segs = [seg for seg in segments if os.path.exists(seg) and os.path.getsize(seg) > 1000]
+    if not valid_segs:
+        raise RuntimeError("لم يتم العثور على مقاطع فيديو مرندرة صالحة للدمج.")
+
     with open(concat_txt, "w", encoding="utf-8") as f:
-        for seg in segments:
+        for seg in valid_segs:
             f.write(f"file '{os.path.abspath(seg)}'\n")
 
     silent_mp4 = os.path.join(work_dir, "video_silent.mp4")
-    subprocess.run(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt, "-c", "copy", silent_mp4],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    res_concat = subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", concat_txt, "-c", "copy", silent_mp4],
+        capture_output=True, text=True
     )
+    if res_concat.returncode != 0:
+        raise RuntimeError(f"فشل تجميع مقاطع الفيديو: {res_concat.stderr}")
 
     vo_info = sf.info(voice_wav)
+    dur_str = f"{vo_info.duration:.2f}"
     if custom_bgm_path and os.path.exists(custom_bgm_path):
         bgm_src = custom_bgm_path
     else:
@@ -100,20 +107,39 @@ def mux_final_video(segments: list, voice_wav: str, custom_bgm_path: str, out_mp
         _generate_cinematic_drone_bed(vo_info.duration + 2.0, bgm_src)
 
     filter_complex = (
-        "[1:a]aresample=24000,volume=1.05[vo];"
-        "[2:a]aresample=24000,aloop=loop=-1:size=2e+09,atrim=0:" + f"{vo_info.duration:.2f}" + ",volume=0.22[bgm];"
-        "[bgm][vo]sidechaincompress=threshold=0.03:ratio=6:attack=35:release=420[ducked];"
-        "[vo][ducked]amix=inputs=2:duration=first:dropout_transition=2,loudnorm=I=-14:TP=-1.5:LRA=11[aout]"
+        "[1:a]aresample=24000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.05,asplit=2[vo_sc][vo_mix];"
+        f"[2:a]aresample=24000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=0:{dur_str},asetpts=PTS-STARTPTS,volume=0.22[bgm];"
+        "[bgm][vo_sc]sidechaincompress=threshold=0.03:ratio=6:attack=35:release=420[ducked];"
+        "[vo_mix][ducked]amix=inputs=2:duration=first:dropout_transition=2,loudnorm=I=-14:TP=-1.5:LRA=11[aout]"
     )
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", silent_mp4, "-i", voice_wav, "-i", bgm_src,
-            "-filter_complex", filter_complex,
-            "-map", "0:v", "-map", "[aout]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", out_mp4
-        ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    cmd_mux = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", silent_mp4,
+        "-i", voice_wav,
+        "-stream_loop", "-1", "-i", bgm_src,
+        "-filter_complex", filter_complex,
+        "-map", "0:v:0", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        "-shortest", out_mp4
+    ]
+    res_mux = subprocess.run(cmd_mux, capture_output=True, text=True)
+
+    # مسار احتياطي مضمون في حال عدم دعم أحد فلاتر الصوت في نسخة FFmpeg على الحاوية
+    if res_mux.returncode != 0 or not os.path.exists(out_mp4) or os.path.getsize(out_mp4) < 10_000:
+        res_fb = subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", silent_mp4, "-i", voice_wav,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", "-shortest", out_mp4
+            ],
+            capture_output=True, text=True
+        )
+        if res_fb.returncode != 0:
+            raise RuntimeError(f"فشل المكساج النهائي: {res_mux.stderr} | {res_fb.stderr}")
+
     return out_mp4
 
 
@@ -156,20 +182,36 @@ def run_full_production(
         with open(sb_path, "w", encoding="utf-8") as f:
             json.dump(shots, f, indent=2, ensure_ascii=False)
 
-    # المرحلة 2: توليد الصوت مفتوح المصدر (يحدد المدة الحقيقية لكل لقطة تلقائياً من الاسكربت)
-    master_vo = synthesize_all_shots(
-        shots, audio_dir, engine_type=tts_engine_choice, kokoro_voice=kokoro_voice,
-        speed=voice_speed, ref_audio_path=ref_voice_file, progress_cb=progress_cb
-    )
+    # المرحلة 2: توليد الصوت مفتوح المصدر (مع تخطي فوري عند الاستكمال إذا كان الصوت جاهزاً)
+    master_vo = os.path.join(audio_dir, "master_voiceover.wav")
     srt_path = os.path.join(pdir, f"{safe_slug}_captions.srt")
-    export_srt(shots, srt_path)
-    with open(sb_path, "w", encoding="utf-8") as f:
-        json.dump(shots, f, indent=2, ensure_ascii=False)
+    audio_ready = (
+        resume_checkpoint
+        and os.path.exists(master_vo)
+        and os.path.exists(srt_path)
+        and all(sh.get("n_frames") and sh.get("audio_path") and os.path.exists(sh["audio_path"]) for sh in shots)
+    )
+    if audio_ready:
+        if progress_cb:
+            progress_cb(0.28, "تم استرجاع التعليق الصوتي الجاهز بالكامل!")
+    else:
+        master_vo = synthesize_all_shots(
+            shots, audio_dir, engine_type=tts_engine_choice, kokoro_voice=kokoro_voice,
+            speed=voice_speed, ref_audio_path=ref_voice_file, progress_cb=progress_cb
+        )
+        export_srt(shots, srt_path)
+        with open(sb_path, "w", encoding="utf-8") as f:
+            json.dump(shots, f, indent=2, ensure_ascii=False)
 
-    # المرحلة 3: صيد الفيديوهات والصور وفحص CLIP وقص اللوجوهات
-    shots = hunt_all_media(shots, media_dir, workers=4, progress_cb=progress_cb)
-    with open(sb_path, "w", encoding="utf-8") as f:
-        json.dump(shots, f, indent=2, ensure_ascii=False)
+    # المرحلة 3: صيد الفيديوهات والصور (مع تخطي فوري عند الاستكمال إذا كانت الميديا جاهزة)
+    media_ready = resume_checkpoint and all(sh.get("asset_path") and os.path.exists(sh["asset_path"]) for sh in shots)
+    if media_ready:
+        if progress_cb:
+            progress_cb(0.58, "تم استرجاع جميع ملفات الميديا المفحوصة بالكامل!")
+    else:
+        shots = hunt_all_media(shots, media_dir, workers=4, progress_cb=progress_cb)
+        with open(sb_path, "w", encoding="utf-8") as f:
+            json.dump(shots, f, indent=2, ensure_ascii=False)
 
     # المرحلة 4: الرندرة المتوازية فائقة السرعة (Multi-Worker Turbo Render + NVENC)
     wm_layer = prepare_watermark_layer(logo_img_file, logo_text, logo_opacity, logo_pos)
@@ -188,7 +230,7 @@ def run_full_production(
     enc_tag = f"GPU NVENC x{RENDER_WORKERS}" if USE_NVENC else f"Turbo CPU x{RENDER_WORKERS}"
     if progress_cb and done_count > 0:
         frac = 0.58 + 0.35 * (done_count / max(1, total))
-        progress_cb(frac, f"تخطي {done_count} لقطة مرندرة مسبقاً، جاري رندر المتبقي ({enc_tag})...")
+        progress_cb(frac, f"تخطي {done_count} لقطة مرندرة مسبقاً ({enc_tag})...")
 
     if pending_tasks:
         with ThreadPoolExecutor(max_workers=RENDER_WORKERS) as pool:
